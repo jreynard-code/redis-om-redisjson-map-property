@@ -1,0 +1,116 @@
+From: jreynard-code
+Subject: [PATCH] Fix: Add Map and Collection converters to RedisOMCustomConversions
+
+When used with spring-data-commons 4.x (Spring Boot 4), calling
+MappingRedisOMConverter.write() on entities containing Map<String, Object>
+fields whose values are themselves Maps causes:
+
+  MappingException: Couldn't find PersistentEntity for type class java.util.LinkedHashMap
+
+This happens because spring-data-commons 4.x no longer creates PersistentEntity
+for JDK Map types. When writeMap() iterates entry values and calls writeInternal(),
+the check customConversions.hasCustomWriteTarget(LinkedHashMap.class) returns false,
+causing writeInternal() to call getRequiredPersistentEntity(LinkedHashMap.class) which
+fails.
+
+Fix: Add WritingConverter implementations for Map and Collection to the static
+omConverters list so that hasCustomWriteTarget() returns true, routing these
+types through writeToBucket() instead of writeInternal().
+
+Also fix the constructor which was ignoring the user-provided converters parameter.
+
+---
+ .../convert/CollectionToBytesConverter.java   | 20 +++++++++++++++++++
+ .../spring/convert/MapToBytesConverter.java   | 20 +++++++++++++++++++
+ .../convert/RedisOMCustomConversions.java     | 12 +++++++----
+ 3 files changed, 48 insertions(+), 4 deletions(-)
+
+diff --git a/redis-om-spring/src/main/java/com/redis/om/spring/convert/MapToBytesConverter.java b/redis-om-spring/src/main/java/com/redis/om/spring/convert/MapToBytesConverter.java
+new file mode 100644
+--- /dev/null
++++ b/redis-om-spring/src/main/java/com/redis/om/spring/convert/MapToBytesConverter.java
+@@ -0,0 +1,20 @@
++package com.redis.om.spring.convert;
++
++import com.google.gson.Gson;
++import org.springframework.core.convert.converter.Converter;
++import org.springframework.data.convert.WritingConverter;
++
++import java.util.Map;
++
++/**
++ * Converts Map instances to byte[] using Gson serialization.
++ * Prevents spring-data-commons 4.x from attempting to resolve
++ * PersistentEntity for Map types during MappingRedisOMConverter.write().
++ */
++@WritingConverter
++public class MapToBytesConverter implements Converter<Map<?, ?>, byte[]> {
++  private static final Gson GSON = new Gson();
++
++  @Override
++  public byte[] convert(Map<?, ?> source) {
++    return GSON.toJson(source).getBytes(java.nio.charset.StandardCharsets.UTF_8);
++  }
++}
+
+diff --git a/redis-om-spring/src/main/java/com/redis/om/spring/convert/CollectionToBytesConverter.java b/redis-om-spring/src/main/java/com/redis/om/spring/convert/CollectionToBytesConverter.java
+new file mode 100644
+--- /dev/null
++++ b/redis-om-spring/src/main/java/com/redis/om/spring/convert/CollectionToBytesConverter.java
+@@ -0,0 +1,20 @@
++package com.redis.om.spring.convert;
++
++import com.google.gson.Gson;
++import org.springframework.core.convert.converter.Converter;
++import org.springframework.data.convert.WritingConverter;
++
++import java.util.Collection;
++
++/**
++ * Converts Collection instances to byte[] using Gson serialization.
++ * Prevents spring-data-commons 4.x from attempting to resolve
++ * PersistentEntity for Collection types during MappingRedisOMConverter.write().
++ */
++@WritingConverter
++public class CollectionToBytesConverter implements Converter<Collection<?>, byte[]> {
++  private static final Gson GSON = new Gson();
++
++  @Override
++  public byte[] convert(Collection<?> source) {
++    return GSON.toJson(source).getBytes(java.nio.charset.StandardCharsets.UTF_8);
++  }
++}
+
+diff --git a/redis-om-spring/src/main/java/com/redis/om/spring/convert/RedisOMCustomConversions.java b/redis-om-spring/src/main/java/com/redis/om/spring/convert/RedisOMCustomConversions.java
+--- a/redis-om-spring/src/main/java/com/redis/om/spring/convert/RedisOMCustomConversions.java
++++ b/redis-om-spring/src/main/java/com/redis/om/spring/convert/RedisOMCustomConversions.java
+@@ -1,6 +1,7 @@
+ package com.redis.om.spring.convert;
+
+ import java.util.ArrayList;
++import java.util.Collection;
+ import java.util.Collections;
+ import java.util.List;
+
+@@ -30,6 +31,10 @@ public class RedisOMCustomConversions extends RedisCustomConversions {
+     // YearMonth
+     omConverters.add(new YearMonthToBytesConverter());
+     omConverters.add(new YearMonthToStringConverter());
+     omConverters.add(new BytesToYearMonthConverter());
++
++    // Map and Collection (required for spring-data-commons 4.x compatibility)
++    omConverters.add(new MapToBytesConverter());
++    omConverters.add(new CollectionToBytesConverter());
+   }
+
+   /**
+@@ -45,6 +50,9 @@ public class RedisOMCustomConversions extends RedisCustomConversions {
+    * @param converters a list of converted to be added to the base list
+    */
+   public RedisOMCustomConversions(List<?> converters) {
+-    super(omConverters);
++    List<Object> allConverters = new ArrayList<>(omConverters);
++    allConverters.addAll((Collection<?>) converters);
++    super(allConverters);
+   }
+ }
