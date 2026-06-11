@@ -1,113 +1,142 @@
-# Map Serialization with Redis OM Spring
+# Redis OM Spring + spring-data-commons 4.x: Map serialization bug reproducer
 
-## Problem
+## Bug
 
-When using `Map<String, Object>` (or `Map<String, Any>`) fields in entities annotated with `@Document` in Redis OM Spring, a persistence error occurs:
+`MappingRedisOMConverter.write()` throws:
 
 ```
-Couldn't find PersistentEntity for type class java.util.LinkedHashMap
+MappingException: Couldn't find PersistentEntity for type class java.util.LinkedHashMap
 ```
 
-### Root Cause
+when a `@Document` entity has a `Map<String, Any>` field containing **nested Map values** (e.g. from Jackson deserializing `{"key": {"nested": "value"}}`).
 
-This issue is caused by a change in **Spring Data Commons** (starting from v4.0.x, included in Spring Boot 4.x):
+## Environment
 
-Spring Data Commons no longer creates `PersistentEntity` instances for standard JDK types such as `Map`, `LinkedHashMap`, `List`, etc.
+| Dependency | Version |
+|---|---|
+| Spring Boot | 4.0.6 |
+| spring-data-commons | 4.0.5 |
+| spring-data-redis | 4.0.5 |
+| Redis OM Spring | 2.0.4 |
+| Kotlin | 2.2.0 |
 
-The problematic execution flow in Redis OM Spring is as follows:
+## Root Cause
 
-1. `MappingRedisOMConverter.writeMap()` is called to serialize a `Map` field
-2. For each map entry value, `writeInternal()` is invoked
-3. `writeInternal()` calls `getRequiredPersistentEntity(LinkedHashMap.class)`
-4. Spring Data Commons v4+ cannot find a `PersistentEntity` for `LinkedHashMap` and throws an exception
+spring-data-commons 4.x no longer creates `PersistentEntity` for JDK Map/Collection types.
 
-### Affected Versions
+In `MappingRedisOMConverter`:
+1. `writeMap()` iterates map entry values
+2. For values that are themselves Maps (e.g. `LinkedHashMap`), it calls `writeInternal()`
+3. `writeInternal()` checks `customConversions.hasCustomWriteTarget(LinkedHashMap.class)` → returns **false**
+4. Falls through to `getRequiredPersistentEntity(LinkedHashMap.class)` → **throws MappingException**
 
-| Redis OM Spring | Spring Boot | Spring Data Commons | Affected |
-|-----------------|-------------|--------------------:|----------|
-| 1.1.x           | 3.5.x      | 3.x                | **No** |
-| 2.0.x           | 4.0.x      | 4.x                | **Yes** |
+`RedisOMCustomConversions` does not register converters for Map or Collection types.
 
-## Workaround
+## Reproduce
 
-The solution is to register **custom converters** (`Map -> byte[]` and `Collection -> byte[]`) in `RedisOMCustomConversions` via reflection, **before** the repository beans are instantiated.
+### Prerequisites
 
-When `customConversions.hasCustomWriteTarget(LinkedHashMap.class)` returns `true`, Redis OM calls `writeToBucket()` instead of `writeInternal()`, thus avoiding the call to `getRequiredPersistentEntity()`.
+- JDK 21+
+- Docker (for Redis Stack)
 
-### Implementation
+### Run the tests (no Docker needed)
 
-The fix uses a `BeanFactoryPostProcessor` that runs before repository beans are instantiated:
+```bash
+./gradlew test
+```
+
+The test `MappingExceptionReproducerTest` proves the bug:
+- `write entity with nested map in additionalData throws MappingException` ← **proves the bug**
+- `write() works fine when map values are simple types` ← shows flat maps work fine
+- `hasCustomWriteTarget returns false for LinkedHashMap` ← confirms root cause
+
+### Run the REST endpoint (requires Docker)
+
+```bash
+docker compose up -d
+./gradlew bootRun
+```
+
+Then call:
+
+```bash
+curl -X POST http://localhost:8080/reproduce \
+  -H "Content-Type: application/json" \
+  -d '{"name": "test", "additionalData": {"simple": "value", "nested": {"key": "deep"}}}'
+```
+
+Returns **HTTP 500** with:
+```
+MappingException: Couldn't find PersistentEntity for type class java.util.LinkedHashMap
+```
+
+## Proposed Fix
+
+Add `MapToBytesConverter` and `CollectionToBytesConverter` to `RedisOMCustomConversions.omConverters`:
 
 ```java
-package com.example.mapserialization.config;
+// In RedisOMCustomConversions static block:
+omConverters.add(new MapToBytesConverter());
+omConverters.add(new CollectionToBytesConverter());
+```
 
-import com.google.gson.Gson;
-import com.redis.om.spring.convert.RedisOMCustomConversions;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.config.BeanFactoryPostProcessor;
-import org.springframework.beans.factory.config.ConfigurableListableBeanFactory;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.core.convert.converter.Converter;
-import org.springframework.data.convert.WritingConverter;
+```java
+@WritingConverter
+public class MapToBytesConverter implements Converter<Map<?, ?>, byte[]> {
+  private static final Gson GSON = new Gson();
 
-import java.util.Collection;
-import java.util.List;
-import java.util.Map;
+  @Override
+  public byte[] convert(Map<?, ?> source) {
+    return GSON.toJson(source).getBytes(StandardCharsets.UTF_8);
+  }
+}
 
-@Configuration
-public class RedisOMMapConverterConfig {
+@WritingConverter
+public class CollectionToBytesConverter implements Converter<Collection<?>, byte[]> {
+  private static final Gson GSON = new Gson();
 
-    private static final Logger logger = LoggerFactory.getLogger(RedisOMMapConverterConfig.class);
-
-    @Bean
-    public BeanFactoryPostProcessor redisOMMapConverterRegistrar() {
-        return (ConfigurableListableBeanFactory beanFactory) -> registerMapConverters();
-    }
-
-    @SuppressWarnings("unchecked")
-    private static void registerMapConverters() {
-        try {
-            var field = RedisOMCustomConversions.class.getDeclaredField("omConverters");
-            field.setAccessible(true);
-            var converters = (List<Object>) field.get(null);
-            converters.add(new MapToBytesConverter());
-            converters.add(new CollectionToBytesConverter());
-            logger.info("Registered Map/Collection -> byte[] converters in RedisOMCustomConversions");
-        } catch (Exception e) {
-            logger.error("Failed to register custom converters in RedisOMCustomConversions: {}", e.getMessage(), e);
-        }
-    }
-
-    @WritingConverter
-    static class MapToBytesConverter implements Converter<Map<?, ?>, byte[]> {
-        private final Gson gson = new Gson();
-
-        @Override
-        public byte[] convert(Map<?, ?> source) {
-            return gson.toJson(source).getBytes(java.nio.charset.StandardCharsets.UTF_8);
-        }
-    }
-
-    @WritingConverter
-    static class CollectionToBytesConverter implements Converter<Collection<?>, byte[]> {
-        private final Gson gson = new Gson();
-
-        @Override
-        public byte[] convert(Collection<?> source) {
-            return gson.toJson(source).getBytes(java.nio.charset.StandardCharsets.UTF_8);
-        }
-    }
+  @Override
+  public byte[] convert(Collection<?> source) {
+    return GSON.toJson(source).getBytes(StandardCharsets.UTF_8);
+  }
 }
 ```
 
-### Why a `BeanFactoryPostProcessor`?
+This makes `hasCustomWriteTarget(LinkedHashMap.class)` return `true`, routing through `writeToBucket()` instead of `writeInternal()`.
 
-The `BeanFactoryPostProcessor` runs **before** Spring beans are created. This is essential because `SimpleRedisDocumentRepository` creates its internal `MappingRedisOMConverter` during instantiation. The converters must therefore be registered before Redis OM repositories are created.
+Also, the `RedisOMCustomConversions` constructor ignores user-provided converters:
+```java
+public RedisOMCustomConversions(List<?> converters) {
+    super(omConverters); // ← 'converters' parameter is ignored!
+}
+```
 
-## Reference
+See [redis-om-spring-pr.patch](redis-om-spring-pr.patch) for the complete fix.
 
-- [PR Cosmo-Tech/cosmotech-api#1163](https://github.com/Cosmo-Tech/cosmotech-api/pull/1163) — Spring Boot 4 migration including this fix
-- Source file: `RedisOMMapConverterConfig.kt`
+## Workaround
 
+Until the fix is merged upstream, use a `BeanFactoryPostProcessor` to patch `omConverters` via reflection:
+
+```kotlin
+@Configuration
+class RedisOMCompatConfig {
+    @Bean
+    fun redisOMMapConverterRegistrar() = BeanFactoryPostProcessor { _ ->
+        val field = RedisOMCustomConversions::class.java.getDeclaredField("omConverters")
+        field.isAccessible = true
+        val converters = field.get(null) as MutableList<Any>
+        converters.add(MapToJsonBytesConverter())
+        converters.add(CollectionToJsonBytesConverter())
+    }
+}
+
+@WritingConverter
+class MapToJsonBytesConverter : Converter<Map<*, *>, ByteArray> {
+    override fun convert(source: Map<*, *>) = Gson().toJson(source).toByteArray(Charsets.UTF_8)
+}
+
+@WritingConverter
+class CollectionToJsonBytesConverter : Converter<Collection<*>, ByteArray> {
+    override fun convert(source: Collection<*>) = Gson().toJson(source).toByteArray(Charsets.UTF_8)
+}
+```
