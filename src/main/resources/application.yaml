@@ -1,7 +1,19 @@
 spring:
   application:
-    name: redis-om-map-reproducer
-  data:
-    redis:
-      host: localhost
-      port: 6379
+    name: mapserialization
+
+springdoc:
+  # See https://springdoc.org/#properties
+  api-docs:
+    path: /v3/api-docs
+  pre-loading-enabled: false
+  remove-broken-reference-definitions: false
+  show-actuator: false
+  swagger-ui:
+    enabled: true
+    # Disable the swagger-ui default petstore url
+    disable-swagger-default-url: true
+    display-request-duration: true
+    url: /openapi.yaml
+    config-url: ""
+  writer-with-default-pretty-printer: true
